@@ -170,6 +170,16 @@ dialog h3{font:600 22px var(--cond);margin:0}
       <ul class="list" id="pointList"></ul>
       <div class="row" style="margin-top:10px">
         <button class="btn primary" id="addBtn">Agregar punto en el mapa</button>
+        <button class="btn" id="detectBtn">Detectar candidatos</button>
+      </div>
+      <div id="candBox" hidden>
+        <h3 style="margin-top:16px">Candidatos detectados</h3>
+        <p class="hint" id="candHint"></p>
+        <ul class="list" id="candList"></ul>
+        <div class="row" style="margin-top:10px">
+          <button class="btn primary" id="candAdd">Agregar los marcados</button>
+          <button class="btn" id="candClose">Descartar</button>
+        </div>
       </div>
       <p class="hint">Los puntos de ejemplo tienen ubicación aproximada: arrastralos en el mapa hasta el lugar exacto. Sumá los que conozcas de tu recorrido.</p>
     </section>
@@ -320,6 +330,7 @@ const S = {
   fc: null,
   hourIdx: null,
   manual: {local: 8, pied: 6},
+  cands: [],
   pick: null // "add" | "via" | null
 };
 function endpoints(){ return S.reversed ? [WORK, HOME] : [HOME, WORK]; }
@@ -360,6 +371,7 @@ const layers = {
   routes: L.layerGroup().addTo(map),
   samples: L.layerGroup().addTo(map),
   points: L.layerGroup().addTo(map),
+  cands: L.layerGroup().addTo(map),
   fixed: L.layerGroup().addTo(map)
 };
 
@@ -825,6 +837,251 @@ $("resetPts").addEventListener("click", () => {
   });
 });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && S.pick) setPick(null); });
+
+/* ---------- Detección automática de candidatos ----------
+   Busca en OpenStreetMap los cruces de cauce, los pasos bajo puente y los túneles
+   de la ruta, y mide con un modelo de elevaciones si además son bajos topográficos. */
+
+function segInt(a, b, c, d){
+  const [ax, ay] = xy(a[0], a[1]), [bx, by] = xy(b[0], b[1]);
+  const [cx, cy] = xy(c[0], c[1]), [dx, dy] = xy(d[0], d[1]);
+  const r1 = bx - ax, r2 = by - ay, s1 = dx - cx, s2 = dy - cy;
+  const den = r1 * s2 - r2 * s1;
+  if (!den) return null;
+  const t = ((cx - ax) * s2 - (cy - ay) * s1) / den;
+  const u = ((cx - ax) * r2 - (cy - ay) * r1) / den;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+  const ang = Math.abs(Math.atan2(r1 * s2 - r2 * s1, r1 * s1 + r2 * s2)) * 180 / Math.PI;
+  return {lat: a[0] + t * (b[0] - a[0]), lng: a[1] + t * (b[1] - a[1]), angle: Math.min(ang, 180 - ang)};
+}
+
+function simplify(coords, every, cap){
+  const out = [];
+  let acc = every;
+  for (let i = 0; i < coords.length; i++){
+    if (i > 0){
+      const [ax, ay] = xy(coords[i-1][0], coords[i-1][1]);
+      const [bx, by] = xy(coords[i][0], coords[i][1]);
+      acc += Math.hypot(bx - ax, by - ay);
+    }
+    if (acc >= every){ acc = 0; out.push(coords[i]); }
+  }
+  if (out.length > cap){
+    const step = Math.ceil(out.length / cap);
+    return out.filter((_, i) => i % step === 0);
+  }
+  return out;
+}
+
+async function overpassNear(coords){
+  const list = coords.map(c => c[0].toFixed(5) + "," + c[1].toFixed(5)).join(",");
+  const q = "[out:json][timeout:90];(" +
+    'way["waterway"](around:35,' + list + ");" +
+    'way["bridge"]["highway"](around:35,' + list + ");" +
+    'way["tunnel"]["highway"](around:35,' + list + ");" +
+    ");out geom;";
+  const r = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body: "data=" + encodeURIComponent(q)
+  });
+  if (!r.ok) throw new Error("Overpass HTTP " + r.status);
+  const j = await r.json();
+  return j.elements || [];
+}
+
+async function elevations(pts){
+  const out = [];
+  for (let i = 0; i < pts.length; i += 100){
+    const c = pts.slice(i, i + 100);
+    const url = "https://api.open-meteo.com/v1/elevation?latitude=" +
+      c.map(p => p.lat.toFixed(5)).join(",") + "&longitude=" + c.map(p => p.lng.toFixed(5)).join(",");
+    const j = await getJSON(url);
+    out.push.apply(out, j.elevation);
+  }
+  return out;
+}
+
+const WW_NAME = {canal: "canal", river: "río", stream: "arroyo", ditch: "acequia", drain: "desagüe", weir: "cauce", wadi: "cauce seco"};
+
+function candidatesFromOSM(elements){
+  const found = [];
+  S.routes.forEach(r => {
+    const rc = simplify(r.coords, 25, 4000);
+    elements.forEach(w => {
+      const g = (w.geometry || []).map(p => [p.lat, p.lon]);
+      if (g.length < 2) return;
+      const tags = w.tags || {};
+      const isWater = !!tags.waterway;
+      const isTunnel = !!tags.tunnel && !!tags.highway;
+      const isBridge = !!tags.bridge && !!tags.highway;
+      if (isTunnel){
+        const mid = g[Math.floor(g.length / 2)];
+        const d = distToRoute({lat: mid[0], lng: mid[1]}, rc);
+        if (d <= 30) found.push({lat: mid[0], lng: mid[1], type: "tunel",
+          name: "Bajo nivel o túnel" + (tags.name ? ": " + tags.name : ""), route: r.name});
+        return;
+      }
+      for (let i = 1; i < rc.length; i++){
+        for (let j = 1; j < g.length; j++){
+          const p = segInt(rc[i-1], rc[i], g[j-1], g[j]);
+          if (!p) continue;
+          if (isBridge && p.angle < 20) continue; // la ruta va sobre ese puente, no por debajo
+          found.push({
+            lat: p.lat, lng: p.lng,
+            type: isWater ? "cauce" : "puente",
+            name: isWater
+              ? "Cruce de " + (WW_NAME[tags.waterway] || "cauce") + (tags.name ? " " + tags.name : "")
+              : "Paso bajo " + (tags.name || "puente"),
+            route: r.name
+          });
+          j = g.length; i = Math.min(i + 3, rc.length);
+        }
+      }
+    });
+  });
+  return found;
+}
+
+function mergeCandidates(list, minDist){
+  const out = [];
+  const rank = {cauce: 3, tunel: 3, puente: 2, bajo: 1};
+  list.forEach(c => {
+    const near = out.find(o => distToRoute(c, [[o.lat, o.lng], [o.lat, o.lng]]) <= minDist);
+    if (!near){ out.push(c); return; }
+    if (rank[c.type] > rank[near.type]){ near.type = c.type; near.name = c.name; }
+    else if (c.type === "bajo" && near.type !== "bajo"){ near.drop = c.drop; }
+  });
+  return out;
+}
+
+async function detectCandidates(){
+  if (busy) return;
+  if (!S.routes.length){ showError("Primero hace falta que se calculen las rutas."); return; }
+  busy = true;
+  showError("");
+  const btn = $("detectBtn");
+  btn.disabled = true;
+  try {
+    setStatus("Buscando cauces, puentes y túneles en OpenStreetMap…");
+    let elements = [];
+    for (const r of S.routes){
+      const els = await overpassNear(simplify(r.coords, 200, 120));
+      elements = elements.concat(els);
+    }
+    const seen = new Set();
+    elements = elements.filter(e => { if (seen.has(e.id)) return false; seen.add(e.id); return true; });
+
+    let cands = mergeCandidates(candidatesFromOSM(elements), 70);
+    if (cands.length > 40) cands = cands.slice(0, 40);
+
+    setStatus("Midiendo alturas del terreno…");
+    const scan = [];
+    S.routes.forEach(r => {
+      let km = 0;
+      let prev = null;
+      simplify(r.coords, 400, 60).forEach(c => {
+        if (prev){
+          const [ax, ay] = xy(prev[0], prev[1]), [bx, by] = xy(c[0], c[1]);
+          km += Math.hypot(bx - ax, by - ay) / 1000;
+        }
+        prev = c;
+        scan.push({lat: c[0], lng: c[1], type: "bajo", route: r.name,
+          name: "Bajo topográfico a " + km.toFixed(1).replace(".", ",") + " km de la salida"});
+      });
+    });
+    const all = mergeCandidates(cands.concat(mergeCandidates(scan, 250)), 120);
+
+    const probe = [];
+    all.forEach(c => {
+      const dLat = 150 / 110540, dLng = 150 / (111320 * Math.cos(c.lat * Math.PI / 180));
+      probe.push({lat: c.lat, lng: c.lng});
+      [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]].forEach(([a, b]) =>
+        probe.push({lat: c.lat + a * dLat, lng: c.lng + b * dLng}));
+    });
+    let elev = [];
+    try { elev = await elevations(probe); } catch (e){ elev = []; }
+
+    all.forEach((c, i) => {
+      if (elev.length < probe.length) return;
+      const base = elev[i * 9];
+      const nb = elev.slice(i * 9 + 1, i * 9 + 9).slice().sort((a, b) => a - b);
+      if (base == null || nb.some(v => v == null)) return;
+      c.drop = Math.round(((nb[3] + nb[4]) / 2 - base) * 10) / 10;
+      c.lowerCount = nb.filter(v => v > base).length;
+    });
+
+    const bajos = all.filter(c => c.type === "bajo" && c.drop >= 1.5 && c.lowerCount >= 6)
+      .sort((a, b) => b.drop - a.drop).slice(0, 8);
+    const keep = all.filter(c => c.type !== "bajo").concat(bajos);
+    const fresh = keep.filter(c => !S.points.some(p => distToRoute(c, [[p.lat, p.lng], [p.lat, p.lng]]) <= 80));
+
+    fresh.forEach((c, i) => {
+      c.id = "c" + i;
+      c.aluvional = c.type === "cauce";
+      c.thr = (c.type === "cauce") ? 10 : 8;
+      if (c.drop >= 2 && c.type !== "bajo") c.thr = 6;
+      c.checked = c.type !== "bajo" || c.drop >= 2.5;
+      const parts = [];
+      if (c.type === "cauce") parts.push("Si baja agua por el cauce, el cruce se corta");
+      if (c.type === "puente" || c.type === "tunel") parts.push("Los bajo niveles acumulan agua cuando el desagüe no da abasto");
+      if (c.drop != null && c.drop >= 1.5) parts.push("El terreno está " + c.drop + " m por debajo de lo que lo rodea");
+      parts.push("Detectado automáticamente, verificá la ubicación");
+      c.note = parts.join(". ") + ".";
+    });
+
+    S.cands = fresh;
+    renderCandidates();
+    setStatus(fresh.length ? "Se encontraron " + fresh.length + " candidatos. Revisalos antes de agregarlos." :
+      "No se encontraron candidatos nuevos sobre las rutas.");
+  } catch (e){
+    showError("Falló la detección automática: " + e.message + ". El servicio de OpenStreetMap a veces está saturado; probá de nuevo en un rato.");
+    setStatus("");
+  }
+  btn.disabled = false;
+  busy = false;
+}
+
+function renderCandidates(){
+  const box = $("candBox"), ul = $("candList");
+  const list = S.cands || [];
+  box.hidden = !list.length;
+  layers.cands.clearLayers();
+  ul.innerHTML = "";
+  if (!list.length) return;
+  $("candHint").textContent = "Destildá los que no correspondan. Al agregarlos podés moverlos y editar su umbral como cualquier punto.";
+  const TYPE = {cauce: "cruce de cauce", puente: "bajo puente", tunel: "bajo nivel", bajo: "bajo topográfico"};
+  list.forEach(c => {
+    const li = document.createElement("li");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = !!c.checked; cb.style.marginTop = "5px";
+    cb.addEventListener("change", () => { c.checked = cb.checked; });
+    const div = document.createElement("div");
+    div.className = "grow";
+    let sub = TYPE[c.type] + ", umbral sugerido " + c.thr + " mm/h";
+    if (c.drop != null && c.drop >= 1.5) sub += ", " + c.drop + " m más bajo que el entorno";
+    if (c.route) sub += ". En " + c.route;
+    div.innerHTML = '<div class="t">' + esc(c.name) + (c.aluvional ? '<span class="tag">aluvional</span>' : "") +
+      "</div><div class=\"s\">" + esc(sub) + "</div>";
+    div.style.cursor = "pointer";
+    div.addEventListener("click", () => map.setView([c.lat, c.lng], 17));
+    li.appendChild(cb); li.appendChild(div);
+    ul.appendChild(li);
+    L.circleMarker([c.lat, c.lng], {radius: 8, color: "#7a3fd6", weight: 3, fillOpacity: .15, dashArray: "3 3"})
+      .bindTooltip("Candidato: " + c.name).addTo(layers.cands);
+  });
+}
+
+$("detectBtn").addEventListener("click", detectCandidates);
+$("candClose").addEventListener("click", () => { S.cands = []; renderCandidates(); });
+$("candAdd").addEventListener("click", () => {
+  const add = (S.cands || []).filter(c => c.checked);
+  add.forEach(c => S.points.push({id: uid(), name: c.name, lat: c.lat, lng: c.lng, thr: c.thr, aluvional: !!c.aluvional, note: c.note}));
+  S.cands = [];
+  renderCandidates();
+  pointsChanged();
+  setStatus(add.length + " punto(s) agregados. Ajustá su ubicación arrastrándolos en el mapa.");
+});
 
 setInterval(() => {
   if (document.visibilityState === "visible" && S.mode === "forecast") refreshAll({routes: false, fit: false});
