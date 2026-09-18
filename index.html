@@ -54,6 +54,16 @@ header p{margin:6px 0 0;color:var(--muted)}
 .seg button{border:0;background:none;padding:9px 14px;cursor:pointer}
 .seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
 
+.geo{position:relative;margin-top:8px}
+.geo input{width:100%;padding:9px 34px 9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+.geo .pickmap{position:absolute;right:4px;top:4px;border:0;background:none;cursor:pointer;font-size:17px;padding:4px 6px}
+.sugg{position:absolute;z-index:600;left:0;right:0;top:100%;background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:3px 0 0;padding:0;list-style:none;max-height:240px;overflow:auto;box-shadow:0 8px 20px rgba(0,0,0,.2)}
+.sugg[hidden]{display:none}
+.sugg li{padding:9px 10px;cursor:pointer;font-size:14px;border-bottom:1px solid var(--line)}
+.sugg li:last-child{border-bottom:0}
+.sugg li:hover{background:var(--bg)}
+#tripEditor{margin-top:12px}
+
 .wx{display:grid;gap:10px;grid-template-columns:1fr 1fr}
 .wx[hidden]{display:none}
 @media (max-width:420px){.wx{grid-template-columns:1fr}}
@@ -141,6 +151,27 @@ dialog h3{font:600 22px var(--cond);margin:0}
         <span id="tripLabel"></span>
         <button class="btn" id="swapBtn" title="Invertir origen y destino">⇅ Ida / vuelta</button>
       </div>
+      <details id="tripEditor">
+        <summary>Cambiar trayecto</summary>
+        <label class="hint" for="tripSelect" style="display:block;margin:10px 0 4px">Trayectos guardados</label>
+        <select id="tripSelect" style="width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)"></select>
+        <div class="geo">
+          <input id="fromInput" type="text" placeholder="Origen: calle y número" autocomplete="off">
+          <button class="pickmap" id="fromPick" title="Elegir en el mapa" type="button">📍</button>
+          <ul class="sugg" id="fromSugg" hidden></ul>
+        </div>
+        <div class="geo">
+          <input id="toInput" type="text" placeholder="Destino: calle y número" autocomplete="off">
+          <button class="pickmap" id="toPick" title="Elegir en el mapa" type="button">📍</button>
+          <ul class="sugg" id="toSugg" hidden></ul>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn primary" id="applyTrip">Usar este trayecto</button>
+          <button class="btn" id="saveTrip">Guardar</button>
+          <button class="btn" id="delTrip">Borrar</button>
+        </div>
+        <p class="hint" id="tripMsg">Cobertura: Luján de Cuyo, Godoy Cruz y Ciudad de Mendoza. Escribí calle y número, o tocá el pin para elegir en el mapa.</p>
+      </details>
     </header>
 
     <div class="seg" role="group" aria-label="Modo">
@@ -270,7 +301,7 @@ const SEED_POINTS = [
    note:"Calles convertidas en río en la tormenta récord de enero. Ubicación aproximada."}
 ];
 
-const LS = {points:"alertaLluvia.points.v1", settings:"alertaLluvia.settings.v1", trip:"alertaLluvia.trip.v1"};
+const LS = {points:"alertaLluvia.points.v1", settings:"alertaLluvia.settings.v1", trip:"alertaLluvia.trip.v1", trips:"alertaLluvia.trips.v1"};
 const LV_TXT = ["Sin riesgo previsto", "Precaución", "Evitar"];
 
 /* ---------- Utilidades ---------- */
@@ -342,6 +373,9 @@ const S = {
   settings: Object.assign({routeThr:10, piedThr:8, nearM:180}, load(LS.settings, {})),
   points: load(LS.points, null) || SEED_POINTS.map(p => Object.assign({}, p)),
   reversed: !!load(LS.trip, {reversed:false}).reversed,
+  trips: load(LS.trips, null) || [{id:"t0", name:"Casa → Trabajo", from:HOME, to:WORK}],
+  tripId: load(LS.trip, {}).id || "t0",
+  draft: {from:null, to:null},
   via: null,
   routes: [],
   fc: null,
@@ -351,7 +385,8 @@ const S = {
   cands: [],
   pick: null // "add" | "via" | null
 };
-function endpoints(){ return S.reversed ? [WORK, HOME] : [HOME, WORK]; }
+if (!S.trips.some(t => t.id === S.tripId)) S.tripId = S.trips[0].id;
+function endpoints(){ const t = currentTrip(); return S.reversed ? [t.to, t.from] : [t.from, t.to]; }
 
 /* ---------- Mapa ---------- */
 const map = L.map("map", {zoomControl: true}).setView([-32.955, -68.865], 12);
@@ -765,7 +800,10 @@ function setPick(mode){
   $("viaBtn").classList.toggle("on", mode === "via");
   const b = $("modeBanner");
   if (mode){
-    b.textContent = mode === "add" ? "Tocá el mapa donde está el punto crítico" : "Tocá el mapa por donde querés forzar el paso";
+    b.textContent = mode === "add" ? "Tocá el mapa donde está el punto crítico"
+      : mode === "via" ? "Tocá el mapa por donde querés forzar el paso"
+      : mode === "from" ? "Tocá el mapa en el punto de partida"
+      : "Tocá el mapa en el destino";
     b.hidden = false;
     map.getContainer().style.cursor = "crosshair";
   } else {
@@ -808,6 +846,10 @@ map.on("click", e => {
     setPick(null);
     S.via = {lat: e.latlng.lat, lng: e.latlng.lng};
     refreshAll({fit: false});
+  } else if (S.pick === "from" || S.pick === "to"){
+    const which = S.pick;
+    setPick(null);
+    pickFromMap(which, e.latlng);
   }
 });
 
@@ -836,7 +878,7 @@ $("rLocal").addEventListener("input", e => { S.manual.local = +e.target.value; r
 $("rPied").addEventListener("input", e => { S.manual.pied = +e.target.value; render(); });
 $("swapBtn").addEventListener("click", () => {
   S.reversed = !S.reversed;
-  save(LS.trip, {reversed: S.reversed});
+  save2Trips();
   refreshAll();
 });
 $("addBtn").addEventListener("click", () => setPick(S.pick === "add" ? null : "add"));
@@ -1157,7 +1199,8 @@ function wxSvg(kind){
 }
 
 async function fetchWeather(){
-  const pts = [HOME, WORK];
+  const t = currentTrip();
+  const pts = [t.from, t.to];
   const url = "https://api.open-meteo.com/v1/forecast?latitude=" + pts.map(p => p.lat.toFixed(4)).join(",") +
     "&longitude=" + pts.map(p => p.lng.toFixed(4)).join(",") +
     "&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m" +
@@ -1232,6 +1275,185 @@ function renderWeather(){
   html += '<div class="wxalerts">' + wxAlerts().map(a => '<span class="chip ' + a.cls + '">' + esc(a.txt) + "</span>").join("") + "</div>";
   box.innerHTML = html;
 }
+
+/* ---------- Trayectos y búsqueda de direcciones ----------
+   Cobertura acotada a Luján de Cuyo, Godoy Cruz y Ciudad de Mendoza. */
+const AREA = {minLat:-33.15, maxLat:-32.83, minLng:-69.05, maxLng:-68.72};
+const OK_DEPTOS = ["lujan de cuyo", "godoy cruz", "capital", "ciudad de mendoza", "mendoza"];
+function norm(s){ return (s || "").toString().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
+
+function inArea(r){
+  const la = +r.lat, ln = +r.lon;
+  if (!(la >= AREA.minLat && la <= AREA.maxLat && ln >= AREA.minLng && ln <= AREA.maxLng)) return false;
+  const a = r.address || {};
+  const fields = [a.city, a.town, a.village, a.municipality, a.county, a.city_district, a.suburb, a.borough].map(norm);
+  return fields.some(f => f && OK_DEPTOS.some(n => f.indexOf(n) >= 0));
+}
+function placeFrom(r){
+  const a = r.address || {};
+  const parts = (r.display_name || "").split(",").map(s => s.trim());
+  const street = a.road ? (a.road + (a.house_number ? " " + a.house_number : "")) : parts[0];
+  const zone = a.suburb || a.city_district || a.town || a.city || a.municipality || a.county || "Mendoza";
+  return {lat: +r.lat, lng: +r.lon, name: street + ", " + zone, short: zone, icon: "📍"};
+}
+
+let geoChain = Promise.resolve(), geoLast = 0;
+function nominatim(path){
+  const run = async () => {
+    const wait = 1100 - (Date.now() - geoLast);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    geoLast = Date.now();
+    return getJSON("https://nominatim.openstreetmap.org/" + path);
+  };
+  geoChain = geoChain.then(run, run);
+  return geoChain;
+}
+function searchAddress(q){
+  return nominatim("search?format=jsonv2&addressdetails=1&limit=10&countrycodes=ar&accept-language=es" +
+    "&bounded=1&viewbox=" + AREA.minLng + "," + AREA.maxLat + "," + AREA.maxLng + "," + AREA.minLat +
+    "&q=" + encodeURIComponent(q));
+}
+function reverseAddress(lat, lng){
+  return nominatim("reverse?format=jsonv2&addressdetails=1&accept-language=es&lat=" + lat.toFixed(6) + "&lon=" + lng.toFixed(6));
+}
+
+function currentTrip(){ return S.trips.find(t => t.id === S.tripId) || S.trips[0]; }
+function tripName(t){ return (t.from.short || t.from.name) + " → " + (t.to.short || t.to.name); }
+
+function renderTripUI(){
+  const sel = $("tripSelect");
+  sel.innerHTML = "";
+  S.trips.forEach(t => {
+    const o = document.createElement("option");
+    o.value = t.id; o.textContent = t.name || tripName(t);
+    if (t.id === S.tripId) o.selected = true;
+    sel.appendChild(o);
+  });
+  const t = currentTrip();
+  if (!S.draft.from) $("fromInput").value = t.from.name;
+  if (!S.draft.to) $("toInput").value = t.to.name;
+  $("delTrip").disabled = S.trips.length < 2;
+}
+
+function setupGeoInput(which){
+  const input = $(which + "Input"), box = $(which + "Sugg");
+  let timer = null;
+  input.addEventListener("input", () => {
+    S.draft[which] = null;
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 4){ box.hidden = true; return; }
+    timer = setTimeout(async () => {
+      try {
+        const res = await searchAddress(q);
+        const list = (res || []).filter(inArea).slice(0, 6);
+        box.innerHTML = "";
+        if (!list.length){
+          const li = document.createElement("li");
+          li.textContent = "Sin resultados dentro de Luján de Cuyo, Godoy Cruz o Ciudad.";
+          li.style.color = "var(--muted)";
+          box.appendChild(li);
+        }
+        list.forEach(r => {
+          const li = document.createElement("li");
+          li.textContent = r.display_name.split(",").slice(0, 4).join(", ");
+          li.addEventListener("mousedown", e => {
+            e.preventDefault();
+            const p = placeFrom(r);
+            S.draft[which] = p;
+            input.value = p.name;
+            box.hidden = true;
+          });
+          box.appendChild(li);
+        });
+        box.hidden = false;
+      } catch (e){
+        box.innerHTML = "";
+        box.hidden = true;
+        $("tripMsg").textContent = "El buscador de direcciones no respondió. Probá de nuevo o elegí el punto en el mapa con el pin.";
+      }
+    }, 700);
+  });
+  input.addEventListener("blur", () => setTimeout(() => { box.hidden = true; }, 150));
+  $(which + "Pick").addEventListener("click", () => setPick(which === "from" ? "from" : "to"));
+}
+
+async function pickFromMap(which, latlng){
+  if (!(latlng.lat >= AREA.minLat && latlng.lat <= AREA.maxLat && latlng.lng >= AREA.minLng && latlng.lng <= AREA.maxLng)){
+    $("tripMsg").textContent = "Ese punto queda fuera de la zona cubierta (Luján de Cuyo, Godoy Cruz y Ciudad).";
+    return;
+  }
+  $("tripMsg").textContent = "Buscando la dirección…";
+  try {
+    const r = await reverseAddress(latlng.lat, latlng.lng);
+    if (!inArea(r)){
+      $("tripMsg").textContent = "Ese punto no pertenece a Luján de Cuyo, Godoy Cruz ni Ciudad de Mendoza.";
+      return;
+    }
+    const p = placeFrom(r);
+    p.lat = latlng.lat; p.lng = latlng.lng;
+    S.draft[which] = p;
+    $(which + "Input").value = p.name;
+    $("tripMsg").textContent = "Punto tomado del mapa. Tocá Usar este trayecto para recalcular.";
+  } catch (e){
+    const p = {lat: latlng.lat, lng: latlng.lng, name: "Punto del mapa", short: "Punto del mapa", icon: "📍"};
+    S.draft[which] = p;
+    $(which + "Input").value = p.name;
+    $("tripMsg").textContent = "No se pudo obtener la dirección, pero el punto quedó tomado.";
+  }
+}
+
+function applyTrip(save){
+  const t = currentTrip();
+  const from = S.draft.from || t.from, to = S.draft.to || t.to;
+  if (from === to || (from.lat === to.lat && from.lng === to.lng)){
+    $("tripMsg").textContent = "El origen y el destino son el mismo punto.";
+    return;
+  }
+  if (save){
+    const nt = {id: uid(), from, to, name: tripName({from, to})};
+    S.trips.push(nt);
+    S.tripId = nt.id;
+  } else {
+    t.from = from; t.to = to;
+    if (!t.custom) t.name = tripName(t);
+    t.custom = t.custom || false;
+  }
+  S.draft = {from: null, to: null};
+  S.cands = [];
+  save2Trips();
+  renderTripUI();
+  renderCandidates();
+  $("tripMsg").textContent = "Trayecto actualizado.";
+  refreshAll();
+}
+function save2Trips(){ save(LS.trips, S.trips); save(LS.trip, {id: S.tripId, reversed: S.reversed}); }
+
+setupGeoInput("from");
+setupGeoInput("to");
+$("tripSelect").addEventListener("change", e => {
+  S.tripId = e.target.value;
+  S.draft = {from: null, to: null};
+  S.cands = [];
+  save2Trips();
+  renderTripUI();
+  renderCandidates();
+  refreshAll();
+});
+$("applyTrip").addEventListener("click", () => applyTrip(false));
+$("saveTrip").addEventListener("click", () => applyTrip(true));
+$("delTrip").addEventListener("click", () => {
+  if (S.trips.length < 2) return;
+  const t = currentTrip();
+  if (!confirm("¿Borrar el trayecto «" + (t.name || tripName(t)) + "»?")) return;
+  S.trips = S.trips.filter(x => x !== t);
+  S.tripId = S.trips[0].id;
+  S.draft = {from: null, to: null};
+  save2Trips();
+  renderTripUI();
+  refreshAll();
+});
+renderTripUI();
 
 setInterval(() => {
   if (document.visibilityState === "visible" && S.mode === "forecast") refreshAll({routes: false, fit: false});
